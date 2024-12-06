@@ -1,188 +1,186 @@
 import argparse
 import socket
 import struct
-from datetime import datetime
 import time
 import logging
-import random
 from queue import Queue, Empty
+from datetime import datetime
+from collections import defaultdict
+import heapq
 
+# Globals
 port = 0
-size = 0
-fwd_table_file = ""
+topology_file = ""
 log_file = ""
-forwarding_table = []
-emulator = None
+neighbors = {}
+topology = {}
+forwarding_table = {}
+hello_intervals = 5
+link_state_intervals = 5
+ttl_default = 10
+seq_numbers = {}
+last_hello = {}
 logger = None
+emulator = None
 
-# priority queues
-high_priority = None
-med_priority = None
-low_priority = None
+def readtopology():
+    """
+    Reads the topology file to initialize the network graph.
+    """
+    global topology, neighbors
+    with open(topology_file, 'r') as file:
+        for line in file:
+            parts = line.strip().split()
+            node = tuple(parts[0].split(','))
+            connections = {}
+            for entry in parts[1:]:
+                neighbor, distance = entry.rsplit(',', 1)
+                neighbor = tuple(neighbor.split(','))
+                connections[neighbor] = int(distance)
+            topology[node] = connections
+            if (socket.gethostname(), str(port)) == node:
+                neighbors = connections
 
-# packet being delayed
-current_packet = None
-current_delay = None
-current_nexthop = None
 
-def create_table():
+def buildForwardTable():
+    """
+    Builds the forwarding table using Dijkstra's algorithm.
+    """
     global forwarding_table
-    emulator_host = socket.gethostname()
+    forwarding_table.clear()
 
-    with open(fwd_table_file, 'r') as table:
-        for line in table:
-            cols = line.strip().split()
-            e_host, e_port, d_host, d_port, hop_host, hop_port, delay, loss = cols
-            # check if emulator matches
-            if emulator_host == e_host and int(e_port) == port:
-                # add to forwarding table
-                forwarding_table.append({
-                    'destination': (d_host, int(d_port)),
-                    'nexthop': (hop_host, int(hop_port)),
-                    'delay': int(delay),
-                    'loss_prob': int(loss)/100
-                })
-    routing()
+    source = (socket.gethostname(), str(port))
+    pq = [(0, source, source)]  # (cost, current_node, next_hop)
+    visited = set()
+    distances = {source: 0}
 
-
-def routing(): 
-    # compare destination of incoming packets with destination in fwd table
-    # if destination exists in fwd table, queue packet for forwarding to next hop
-    # if destination not found, drop packet, log event
-    while True:
-        try:
-            packet, (sender_ip, sender_port) = emulator.recvfrom(5200)
-            priority, src_ip, src_port, dst_ip, dst_port, length = struct.unpack('!c4sH4sHI', packet[:17])
-            payload = packet[17:]
-            src_ip = socket.inet_ntoa(src_ip)
-            dst_ip = socket.inet_ntoa(dst_ip)
-            packet_type, seq, payload_length = struct.unpack('!cII',payload[:9])
-            found = False
-            dst_name = socket.gethostbyaddr(dst_ip)[0].split(".")[0]
-            for entry in forwarding_table:
-                if entry['destination'] == (dst_name, dst_port):
-                    found = True
-                    queueing(packet, entry)
-                    break
-
-            if found == False:
-                reason = "No forwarding entry found"
-                logger.info("Source=(%s:%i) Destination=(%s:%i) Type=%c Priority=%c Payload Size=%i Time=%s Reason=%s",
-                          socket.inet_ntoa(src_ip), int(src_port), socket.inet_ntoa(dst_ip), int(dst_port), packet_type.decode(), priority.decode(), length, datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], reason)
-        except BlockingIOError:
-            pass
-
-        send()
-
-    
-
-def queueing(packet, nexthop):
-    # examine priority field on packet and place packet in appropriate queue
-    # if queue is full, drop packet, log event
-    priority, src_ip, src_port, dst_ip, dst_port, length = struct.unpack('!c4sH4sHI', packet[:17])
-    payload = packet[17:]
-    packet_type, seq, payload_length = struct.unpack('!cII',payload[:9])
-    
-
-    if priority == b'1':
-        if high_priority.full():
-            reason = "Priority queue 1 was full"
-            logger.info("Source=(%s:%i) Destination=(%s:%i) Type=%c Priority=%c Payload Size=%i Time=%s Reason=%s",
-                          socket.inet_ntoa(src_ip), int(src_port), socket.inet_ntoa(dst_ip), int(dst_port), packet_type.decode(), priority.decode(), length, datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], reason)
-        else:
-            high_priority.put((packet,nexthop))
-
-    elif priority == b'2':
-        if med_priority.full():
-            reason = "Priority queue 2 was full"
-            logger.info("Source=(%s:%i) Destination=(%s:%i) Type=%c Priority=%c Payload Size=%i Time=%s Reason=%s",
-                          socket.inet_ntoa(src_ip), int(src_port), socket.inet_ntoa(dst_ip), int(dst_port), packet_type.decode(), priority.decode(), length, datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], reason)
-        else:
-            med_priority.put((packet,nexthop))
-    
-    elif priority == b'3':
-        if low_priority.full():
-            reason = "Priority queue 3 was full"
-            logger.info("Source=(%s:%i) Destination=(%s:%i) Type=%c Priority=%c Payload Size=%i Time=%s Reason=%s",
-                          socket.inet_ntoa(src_ip), int(src_port), socket.inet_ntoa(dst_ip), int(dst_port), packet_type.decode(), priority.decode(), length, datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], reason)
-        else:
-            low_priority.put((packet,nexthop))
-
-    else:
-        reason = "Invalid priority specified in packet"
-        logger.info("Source=(%s:%i) Destination=(%s:%i) Type=%c Priority=%c Payload Size=%i Time=%s Reason=%s",
-                          socket.inet_ntoa(src_ip), int(src_port), socket.inet_ntoa(dst_ip), int(dst_port), packet_type.decode(), priority.decode(), length, datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], reason)
-def send():
-    # accept packets from 3 queues + simulate network link conditions for each dest
-    # packets bound for destination are first delayed
-    # after delay, packet may be dropped -> log event
-    # if not dropped, send packet to network
-    global current_packet, current_delay, current_nexthop
-
-    # check if there is a packet being delayed
-    if current_packet:
-        if time.time() - current_delay >= current_nexthop['delay']/1000 :
-            payload = current_packet[17:]
-            packet_type, seq, payload_length = struct.unpack('!cII',payload[:9])
-            if packet_type!=b'E' and packet_type!=b'R' and random.random() <= current_nexthop['loss_prob']:
-                priority, src_ip, src_port, dst_ip, dst_port, length = struct.unpack('!c4sH4sHI', current_packet[:17])
-                reason = "Loss event occured"
-                logger.info("Source=(%s:%i) Destination=(%s:%i) Type=%c Priority=%c Payload Size=%i Time=%s Reason=%s",
-                          socket.inet_ntoa(src_ip), int(src_port), socket.inet_ntoa(dst_ip), int(dst_port), packet_type.decode(), priority.decode(), length, datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], reason)
-            else:
-                emulator.sendto(current_packet, (current_nexthop['nexthop'][0], current_nexthop['nexthop'][1]))
-            
-            # reset values
-            current_packet = None
-            current_delay = None
-            current_nexthop = None
-            return
-    
-    if not current_packet:
-        (current_packet, current_nexthop) = get_priority_packet()
-        if current_packet:
-            current_delay = time.time()
-
-def get_priority_packet():
-    for priority_queue in [high_priority, med_priority, low_priority]:
-        try:
-            (packet, nexthop) = priority_queue.get_nowait()
-            return (packet, nexthop)
-        except Empty:
+    while pq:
+        cost, current, next_hop = heapq.heappop(pq)
+        if current in visited:
             continue
-    return None, None
+        visited.add(current)
+
+        if current != source:
+            forwarding_table[current] = next_hop
+
+        for neighbor, weight in topology.get(current, {}).items():
+            if neighbor not in visited:
+                new_cost = cost + weight
+                if new_cost < distances.get(neighbor, float('inf')):
+                    distances[neighbor] = new_cost
+                    heapq.heappush(pq, (new_cost, neighbor, neighbor if current == source else next_hop))
+
+    logger.info("Updated Forwarding Table: %s", forwarding_table)
+
+
+def send_hello_messages():
+    """
+    Sends HelloMessages to all neighbors.
+    """
+    global last_hello
+    for neighbor in neighbors:
+        packet = struct.pack("!s", b'H')  # HelloMessage identifier
+        emulator.sendto(packet, (neighbor[0], int(neighbor[1])))
+    logger.info("Sent HelloMessages to neighbors.")
+
+
+def send_link_state_message():
+    """
+    Sends LinkStateMessages to all neighbors.
+    """
+    global seq_numbers
+    node = (socket.gethostname(), str(port))
+    seq_numbers[node] = seq_numbers.get(node, 0) + 1
+
+    packet = struct.pack("!s", b'L') + struct.pack("!I", seq_numbers[node])
+    neighbors_data = [(neighbor[0], int(neighbor[1]), weight) for neighbor, weight in neighbors.items()]
+    packet += struct.pack("!I", len(neighbors_data))  # Number of neighbors
+    for ip, port, weight in neighbors_data:
+        packet += struct.pack("!50sI", ip.encode(), port, weight)
+
+    for neighbor in neighbors:
+        emulator.sendto(packet, (neighbor[0], int(neighbor[1])))
+    logger.info("Sent LinkStateMessages to neighbors.")
+
+
+def process_packet():
+    """
+    Processes incoming packets.
+    """
+    try:
+        packet, addr = emulator.recvfrom(1024)
+        packet_type = struct.unpack("!s", packet[:1])[0]
+        
+        if packet_type == b'H':  # HelloMessage
+            last_hello[addr] = time.time()
+            logger.info("Received HelloMessage from %s", addr)
+        elif packet_type == b'L':  # LinkStateMessage
+            process_link_state_message(packet, addr)
+        else:
+            logger.warning("Unknown packet type received: %s", packet_type)
+    except BlockingIOError:
+        pass
+
+
+def process_link_state_message(packet, addr):
+    """
+    Processes a LinkStateMessage and updates the topology.
+    """
+    global topology
+    node = addr
+    seq_no = struct.unpack("!I", packet[1:5])[0]
+    if seq_no <= seq_numbers.get(node, 0):
+        return  # Ignore old message
+
+    seq_numbers[node] = seq_no
+    num_neighbors = struct.unpack("!I", packet[5:9])[0]
+    neighbors = {}
+    offset = 9
+    for _ in range(num_neighbors):
+        ip, port, weight = struct.unpack("!50sI", packet[offset:offset + 54])
+        neighbors[(ip.decode().strip(), str(port))] = weight
+        offset += 54
+    topology[node] = neighbors
+    logger.info("Updated topology: %s", topology)
+    buildForwardTable()
 
 
 def main():
-    global port, size, fwd_table_file, log_file, high_priority, med_priority, low_priority, emulator, logger
-    parser = argparse.ArgumentParser(description="Parse command line arguments for emulator")
+    global port, topology_file, log_file, emulator, logger
+    parser = argparse.ArgumentParser(description="Emulator for Link-State Routing Protocol")
+    parser.add_argument('-p', '--port', type=int, required=True, help="Port of the emulator")
+    parser.add_argument('-f', '--file', type=str, required=True, help="Topology file")
+    parser.add_argument('-l', '--log', type=str, required=True, help="Log file")
 
-    parser.add_argument('-p','--port', type=int, required=True, help="Port of the emulator")
-    parser.add_argument('-q','--queue_size', type=int, required=True, help="Size of each queue")
-    parser.add_argument('-f', '--filename', type=str, required=True, help="Name of file containing static forwarding table")
-    parser.add_argument('-l','--log',type=str, required=True, help="Name of the log file")
-
-    args=parser.parse_args()
-
+    args = parser.parse_args()
     port = args.port
-    size = args.queue_size
-    fwd_table_file = args.filename
+    topology_file = args.file
     log_file = args.log
 
-    high_priority = Queue(maxsize = size)
-    med_priority = Queue(maxsize = size)
-    low_priority = Queue(maxsize = size)
-
+    logger = logging.getLogger()
+    logging.basicConfig(filename=log_file, level=logging.INFO)
     emulator = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    emulator.bind(("",port))
+    emulator.bind(("", port))
     emulator.setblocking(False)
 
-    logger = logging.getLogger()
-    logging.basicConfig(filename=log_file, filemode='w', encoding='utf-8', level = logging.INFO)
+    readtopology()
+    buildForwardTable()
 
-    create_table()
-   
+    hello_timer = time.time()
+    link_state_timer = time.time()
+
+    while True:
+        process_packet()
+
+        # Periodic tasks
+        current_time = time.time()
+        if current_time - hello_timer >= hello_intervals:
+            send_hello_messages()
+            hello_timer = current_time
+        if current_time - link_state_timer >= link_state_intervals:
+            send_link_state_message()
+            link_state_timer = current_time
+
 
 if __name__ == "__main__":
     main()
-

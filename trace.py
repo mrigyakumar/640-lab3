@@ -1,67 +1,89 @@
-import socket
 import argparse
+import socket
 import struct
-import sys
-import time
+from datetime import datetime
 
-# Define the packet structure
-PACKET_FORMAT = "!I16sH16sH"  # TTL (I), Src IP (16s), Src Port (H), Dst IP (16s), Dst Port (H)
+def send_routetrace_packet(sock, ttl, src_ip, src_port, dst_ip, dst_port, emulator_ip, emulator_port, debug):
+    # Create a routetrace packet with the required fields
+    packet = struct.pack('!I4sH4sH', ttl, socket.inet_aton(src_ip), src_port, socket.inet_aton(dst_ip), dst_port)
 
-def create_packet(ttl, src_ip, src_port, dst_ip, dst_port):
-    """Create a routetrace packet."""
-    return struct.pack(PACKET_FORMAT, ttl, socket.inet_aton(src_ip), src_port, socket.inet_aton(dst_ip), dst_port)
+    if debug:
+        print(f"Sending packet: TTL={ttl}, Source=({src_ip}:{src_port}), Destination=({dst_ip}:{dst_port})")
+    
+    # Send packet to the source emulator
+    sock.sendto(packet, (emulator_ip, emulator_port))
 
-def parse_packet(packet):
-    """Parse a routetrace packet."""
-    ttl, src_ip, src_port, dst_ip, dst_port = struct.unpack(PACKET_FORMAT, packet)
-    return ttl, socket.inet_ntoa(src_ip), src_port, socket.inet_ntoa(dst_ip), dst_port
-
-def routetrace(port, src_host, src_port, dst_host, dst_port, debug):
-    """Implements the routetrace application."""
+def receive_routetrace_packet(sock, debug):
+    # Wait for a response packet from the emulator
     try:
-        # Create a UDP socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("", port))
+        response, (ip, port) = sock.recvfrom(1024)
+        ttl, src_ip, src_port, dst_ip, dst_port = struct.unpack('!I4sH4sH', response)
+        src_ip = socket.inet_ntoa(src_ip)
+        dst_ip = socket.inet_ntoa(dst_ip)
+        
+        if debug:
+            print(f"Received packet: TTL={ttl}, Responder=({ip}:{port}), "
+                  f"Source=({src_ip}:{src_port}), Destination=({dst_ip}:{dst_port})")
+        
+        return ip, port
+    except socket.timeout:
+        print("Timeout waiting for response.")
+        return None
 
-        ttl = 0  # Start with TTL = 0
-        while True:
-            # Create and send a packet
-            packet = create_packet(ttl, src_host, src_port, dst_host, dst_port)
-            sock.sendto(packet, (src_host, src_port))
-
-            if debug:
-                print(f"Sent packet: TTL={ttl}, Src=({src_host}:{src_port}), Dst=({dst_host}:{dst_port})")
-
-            # Wait for a response
-            response, addr = sock.recvfrom(1024)
-            resp_ttl, resp_src_ip, resp_src_port, resp_dst_ip, resp_dst_port = parse_packet(response)
-
-            print(f"Received response: Src=({resp_src_ip}:{resp_src_port}), Dst=({resp_dst_ip}:{resp_dst_port})")
-
-            # Check if the destination is reached
-            if (resp_src_ip, resp_src_port) == (dst_host, dst_port):
-                print("Destination reached!")
-                break
-
-            # Increment TTL and continue
-            ttl += 1
-
-        sock.close()
-
-    except Exception as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-
-if __name__ == "__main__":
-    # Argument parsing
-    parser = argparse.ArgumentParser(description="routetrace application")
-    parser.add_argument("-a", type=int, required=True, help="Routetrace port")
-    parser.add_argument("-b", required=True, help="Source hostname")
-    parser.add_argument("-c", type=int, required=True, help="Source port")
-    parser.add_argument("-d", required=True, help="Destination hostname")
-    parser.add_argument("-e", type=int, required=True, help="Destination port")
-    parser.add_argument("-f", type=int, choices=[0, 1], required=True, help="Debug option (0 or 1)")
+def main():
+    # Argument parser for the command-line inputs
+    parser = argparse.ArgumentParser(description="Routetrace application to trace the shortest path in a network.")
+    parser.add_argument('-a', '--port', type=int, required=True, help="Routetrace port")
+    parser.add_argument('-b', '--source_host', type=str, required=True, help="Source hostname")
+    parser.add_argument('-c', '--source_port', type=int, required=True, help="Source port")
+    parser.add_argument('-d', '--dest_host', type=str, required=True, help="Destination hostname")
+    parser.add_argument('-e', '--dest_port', type=int, required=True, help="Destination port")
+    parser.add_argument('-f', '--debug', type=int, choices=[0, 1], required=True, help="Debug option (0 or 1)")
 
     args = parser.parse_args()
 
-    routetrace(args.a, args.b, args.c, args.d, args.e, args.f)
+    routetrace_port = args.port
+    source_host = args.source_host
+    source_port = args.source_port
+    dest_host = args.dest_host
+    dest_port = args.dest_port
+    debug = args.debug
+
+    # Initialize the socket for the routetrace application
+    routetrace_ip = socket.gethostbyname(socket.gethostname())
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((routetrace_ip, routetrace_port))
+    sock.settimeout(5)  # Timeout for receiving packets
+
+    # Convert destination host to IP
+    dest_ip = socket.gethostbyname(dest_host)
+    source_ip = socket.gethostbyname(source_host)
+
+    print(f"Starting routetrace from ({source_ip}:{source_port}) to ({dest_ip}:{dest_port})")
+
+    ttl = 0
+    while True:
+        # Send a routetrace packet to the source emulator
+        send_routetrace_packet(sock, ttl, routetrace_ip, routetrace_port, dest_ip, dest_port, source_ip, source_port, debug)
+
+        # Wait for a response from the emulator
+        response = receive_routetrace_packet(sock, debug)
+        if response is None:
+            print("No response received. Terminating.")
+            break
+        
+        ip_received, port_received = response
+
+        # Print the hop details
+        print(f"Hop: {ip_received}:{port_received}")
+
+        # Check if we reached the destination
+        if (ip_received, port_received) == (dest_ip, dest_port):
+            print("Destination reached!")
+            break
+        
+        # Increment TTL for the next hop
+        ttl += 1
+
+if __name__ == "__main__":
+    main()

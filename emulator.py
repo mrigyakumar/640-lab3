@@ -82,22 +82,33 @@ def send_hello():
     """Send Hello messages to all neighbors."""
     global last_hello
     for neighbor in route_topology[ip_port]:
-        message = f"HELLO {ip_port}"
+        message = f"HELLO {ip_port} {route_topology[ip_port][neighbor]}"
         emulator.sendto(message.encode(), parse_ip_port(neighbor))
     last_hello[ip_port] = time.time()
 
 
-def handle_hello(sender):
+def handle_hello(sender, cost):
     """Handle a Hello message."""
+    change = False
+    # add sender to self neighbors if not present
     if sender not in route_topology[ip_port]:
-        return
+        route_topology[ip_port][sender] = int(cost)
+        change = True
+    # add neighbor to topology with cost to self
+    if sender not in route_topology:
+        route_topology[sender][ip_port] = int(cost)
+        change = True
     last_hello[sender] = time.time()
+    if(change == True):
+        print("Changed Topology:")
+        print_topology()
+        build_forward_table
 
 
 def send_link_state():
     """Send Link-State messages to all neighbors."""
     seq_numbers[ip_port] += 1
-    message = f"LS {ip_port} {seq_numbers[ip_port]} {len(route_topology[ip_port])}"
+    message = f"LS {ip_port} {seq_numbers[ip_port]} {len(route_topology[ip_port]) + 1}"
     for neighbor, cost in route_topology[ip_port].items():
         message += f" {neighbor},{cost}"
     for neighbor in route_topology[ip_port]:
@@ -108,23 +119,40 @@ def handle_link_state(message):
     """Handle a Link-State message."""
     global previous_topology
     parts = message.split()
-    sender, seq_num = parts[1], int(parts[2])
-    if seq_num <= seq_numbers[sender]:
+    sender, seq_num, ttl = parts[1], int(parts[2]), int(parts[3])
+    if seq_num <= seq_numbers[sender] or ttl == 0:
         return
 
     seq_numbers[sender] = seq_num
     neighbors = parts[4:]
-    new_neighbors = {n.rsplit(',', 1)[0]: int(n.rsplit(',', 1)[1]) for n in neighbors}
+    new_neighbors = {n.rsplit(',',1)[0]: int(n.rsplit(',',1)[1]) for n in neighbors}
+    # removed_neighbors = {n for n in route_topology if n not in new_neighbors}
 
     # Check if the topology actually changed
     if route_topology.get(sender) != new_neighbors:
         route_topology[sender] = new_neighbors
+        # if removed_neighbors:
+        #     for n in removed_neighbors:
+        #         del route_topology[n]
+        #         for node,neighbors in route_topology.items():
+        #             if n in neighbors:
+        #                 del route_topology[node][n]
         print(f"Topology updated with Link-State message from {sender}.")
         print("Updated Topology:")
         print_topology()
         build_forward_table()
         if route_topology != previous_topology:
             previous_topology = route_topology.copy()
+    
+    # forward link state packet to all neighbours
+    ttl = ttl-1
+    if ttl > 0:
+        updated_msg = f"LS {sender} {seq_num} {ttl}"
+        for neighbor, cost in route_topology[sender].items():
+            updated_msg += f" {neighbor},{cost}"
+        for neighbor in route_topology[ip_port]:
+            emulator.sendto(updated_msg.encode(), parse_ip_port(neighbor))
+
         
 
 
@@ -138,15 +166,17 @@ def check_hello_timeout():
         if current_time - last_hello[neighbor] > HELLO_TIMEOUT:
             print(f"Neighbor {neighbor} timed out.")
             del last_hello[neighbor]
-            if neighbor in route_topology[ip_port]:
-                del route_topology[ip_port][neighbor]
-                topology_changed = True
-                print("Changed Topology:")
-                print_topology()
-                build_forward_table()
+            del route_topology[neighbor]
+            for node,neighbors in route_topology.items():
+                if neighbor in neighbors:
+                    del route_topology[node][neighbor]
+                    topology_changed = True
 
     if topology_changed:
         previous_topology = route_topology.copy()
+        print("Changed Topology:")
+        print_topology()
+        build_forward_table()
 
 
 def parse_ip_port(address):
@@ -162,8 +192,6 @@ def handle_binary_packet(data, addr):
         src_ip = socket.inet_ntoa(src_ip)
         dst_ip = socket.inet_ntoa(dst_ip)
 
-        print(f"Routetrace packet received: TTL={ttl}, Source=({src_ip}:{src_port}), Destination=({dst_ip}:{dst_port})")
-
         # Check if this emulator is the destination
         local_ip, local_port = ip_port.split(',')
         if (local_ip == dst_ip and int(local_port) == dst_port) or (ttl == 0):
@@ -176,12 +204,9 @@ def handle_binary_packet(data, addr):
             destination = f"{dst_ip},{dst_port}"
             if destination in forwarding_table:
                 next_hop = forwarding_table[destination]
-                print(f"Forwarding packet to next hop: {next_hop}")
                 forwarded_packet = struct.pack('!I4sH4sH', ttl, socket.inet_aton(src_ip), src_port,
                                                socket.inet_aton(dst_ip), dst_port)
                 emulator.sendto(forwarded_packet, parse_ip_port(next_hop))
-            else:
-                print(f"No route to destination {dst_ip}:{dst_port}. Packet dropped.")
         return
     except Exception as e:
         print(f"Error handling binary packet: {e}")
@@ -214,7 +239,8 @@ def main():
                 message = data.decode()  # Try decoding as a text message
                 if message.startswith("HELLO"):
                     sender = message.split()[1]
-                    handle_hello(sender)
+                    cost = message.split()[2]
+                    handle_hello(sender, cost)
                 elif message.startswith("LS"):
                     handle_link_state(message)
             except UnicodeDecodeError:
